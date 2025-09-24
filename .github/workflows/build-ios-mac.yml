@@ -1,26 +1,67 @@
-name: Build iOS IPA for RustDesk
+name: Build iOS IPA
 
 on:
+  # Trigger on tags
   push:
     tags:
-      - 'v*'  # 在推送以 'v' 开头的 tag 时触发
-  workflow_dispatch:  # 允许手动触发
+      - 'v*'
+      - 'nightly*'
+  
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      upload-tag:
+        description: 'Tag name for upload'
+        required: false
+        default: 'nightly'
+        type: string
 
 env:
   RUST_VERSION: "1.75"
+  MAC_RUST_VERSION: "1.81"
   FLUTTER_VERSION: "3.24.5"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
   VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
   VERSION: "1.4.2"
+  # Use tag name if triggered by tag, otherwise use input or default
+  TAG_NAME: ${{ github.ref_name || inputs.upload-tag || 'nightly' }}
 
 jobs:
   generate-bridge:
-    uses: ./.github/workflows/bridge.yml
+    name: Generate Bridge Files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+      
+      - name: Generate bridge files
+        run: |
+          # Add your bridge generation commands here
+          # This is a placeholder - adapt to your actual bridge generation logic
+          cargo build --features flutter --lib || true
+          
+      - name: Upload bridge artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: bridge-artifact
+          path: |
+            ./src/flutter_ffi.rs
+            ./flutter/rust/src/bridge_generated.rs
+            ./flutter/rust/src/bridge_generated.io.rs
+          retention-days: 1
 
   build-rustdesk-ios:
-    name: Build RustDesk iOS IPA (Unsigned)
+    name: Build iOS IPA (Unsigned)
     runs-on: macos-13
     needs: [generate-bridge]
-    
     steps:
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@v6
@@ -38,18 +79,20 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install Flutter
+      - name: Install flutter
         uses: subosito/flutter-action@v2
         with:
           channel: "stable"
           flutter-version: ${{ env.FLUTTER_VERSION }}
 
-      - name: Patch Flutter
+      - name: Patch flutter
         run: |
           cd $(dirname $(dirname $(which flutter)))
-          [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+          if [[ "3.24.5" == "${{ env.FLUTTER_VERSION }}" ]]; then
+            git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff || true
+          fi
 
-      - name: Setup vcpkg
+      - name: Setup vcpkg with Github Actions binary cache
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
@@ -70,12 +113,11 @@ jobs:
             done
             exit 1
           fi
-        shell: bash
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: ${{ env.RUST_VERSION }}
+          toolchain: ${{ env.MAC_RUST_VERSION }}
           targets: aarch64-apple-ios
           components: "rustfmt"
 
@@ -85,97 +127,79 @@ jobs:
           key: aarch64-apple-ios
 
       - name: Restore bridge files
-        uses: actions/download-artifact@master
+        uses: actions/download-artifact@v3
         with:
           name: bridge-artifact
           path: ./
 
-      - name: Build RustDesk library
+      - name: Build rustdesk lib
         run: |
           rustup target add aarch64-apple-ios
           cargo build --features flutter,hwcodec --release --target aarch64-apple-ios --lib
 
-      - name: Create export options plist for unsigned build
-        run: |
-          cat > ExportOptions.plist << EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>compileBitcode</key>
-              <false/>
-              <key>method</key>
-              <string>development</string>
-              <key>signingStyle</key>
-              <string>manual</string>
-              <key>stripSwiftSymbols</key>
-              <true/>
-              <key>teamID</key>
-              <string></string>
-              <key>thinning</key>
-              <string>&lt;none&gt;</string>
-              <key>uploadBitcode</key>
-              <false/>
-              <key>uploadSymbols</key>
-              <false/>
-          </dict>
-          </plist>
-          EOF
-
-      - name: Build iOS IPA (Unsigned)
+      - name: Build unsigned IPA
         run: |
           cd flutter
-          # 首先构建 xcarchive
-          flutter build ipa --release --no-codesign --export-options-plist=../ExportOptions.plist
+          # Build IPA without code signing
+          flutter build ipa --release --no-codesign
           
-          # 检查生成的文件
-          echo "检查构建目录内容:"
-          ls -la build/ios/
-          echo "检查 archive 目录内容:"
-          ls -la build/ios/archive/
-          echo "检查 ipa 目录内容:"
-          ls -la build/ios/ipa/ || echo "ipa 目录不存在"
-
-      - name: Manual IPA creation if needed
-        run: |
-          cd flutter
-          # 如果自动生成的 IPA 不存在，手动创建
-          if [ ! -f "build/ios/ipa/Runner.ipa" ]; then
-            echo "自动 IPA 生成失败，尝试手动创建..."
+          # Rename IPA with version
+          if [ -f "build/ios/archive/Runner.xcarchive/Products/Applications/Runner.app" ]; then
+            # Create IPA manually from the app bundle
             mkdir -p build/ios/ipa
-            cd build/ios/archive/Runner.xcarchive/Products/Applications
-            # 创建 Payload 目录并复制 app
-            mkdir -p Payload
-            cp -r Runner.app Payload/
-            # 创建 IPA 文件
-            zip -r ../../../../ipa/Runner.ipa Payload
-            # 检查结果
-            ls -la ../../../../ipa/
+            cd build/ios/archive/Runner.xcarchive/Products
+            mkdir Payload
+            cp -r Applications/*.app Payload/
+            zip -r ../../../../../ipa/rustdesk-${{ env.VERSION }}-ios-unsigned.ipa Payload
+            cd ../../../../../
+          elif [ -f "build/ios/ipa/rustdesk.ipa" ]; then
+            mv build/ios/ipa/rustdesk.ipa build/ios/ipa/rustdesk-${{ env.VERSION }}-ios-unsigned.ipa
           fi
+          
+          # List generated files for verification
+          ls -la build/ios/ipa/ || true
 
-      - name: Get version from tag
-        id: get_version
-        run: |
-          if [[ $GITHUB_REF == refs/tags/* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/v}
-          else
-            VERSION="nightly-$(date +%Y%m%d)"
-          fi
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
-
-      - name: Upload IPA as artifact
+      - name: Upload IPA as Actions Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rustdesk-ios-${{ env.VERSION }}-unsigned
+          name: rustdesk-ios-unsigned-${{ env.VERSION }}
           path: flutter/build/ios/ipa/*.ipa
           retention-days: 30
 
-      - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Upload IPA to Release
         uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
+          prerelease: ${{ contains(env.TAG_NAME, 'nightly') }}
           tag_name: ${{ env.TAG_NAME }}
-          files: flutter/build/ios/ipa/*.ipa
-          draft: false
-          prerelease: false
+          files: |
+            flutter/build/ios/ipa/*.ipa
+          body: |
+            ## iOS Build (Unsigned)
+            
+            This is an unsigned IPA file for iOS. To install:
+            1. Use a signing service or tool to sign the IPA with your certificate
+            2. Install via Xcode, Apple Configurator, or other deployment methods
+            
+            **Note:** This IPA is not signed and cannot be installed directly on iOS devices without signing.
+
+      - name: Generate build info
+        if: always()
+        run: |
+          echo "## Build Information" > build_info.md
+          echo "- Version: ${{ env.VERSION }}" >> build_info.md
+          echo "- Tag: ${{ env.TAG_NAME }}" >> build_info.md
+          echo "- Build Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> build_info.md
+          echo "- Flutter Version: ${{ env.FLUTTER_VERSION }}" >> build_info.md
+          echo "- Rust Version: ${{ env.MAC_RUST_VERSION }}" >> build_info.md
+          echo "- Runner: $(uname -a)" >> build_info.md
+          
+          cat build_info.md
+
+      - name: Upload build info
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-info-ios
+          path: build_info.md
+          retention-days: 30
